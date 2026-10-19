@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS orders (
   id TEXT PRIMARY KEY,
   total_cents INTEGER NOT NULL,
   currency TEXT NOT NULL,
-  coupon_code TEXT,
+  coupon_codes TEXT NOT NULL,
   utm_source TEXT,
   utm_medium TEXT,
   utm_campaign TEXT,
@@ -53,7 +53,11 @@ export function inTransaction<T>(db: DatabaseSync, work: () => T): T {
     db.exec("COMMIT");
     return result;
   } catch (error) {
-    db.exec("ROLLBACK");
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // keep the original error, it is the useful one
+    }
     throw error;
   }
 }

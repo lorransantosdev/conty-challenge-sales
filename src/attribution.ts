@@ -5,12 +5,13 @@ export type AttributionSource = "coupon" | "utm";
 export type Attribution = {
   creatorId: string | null;
   source: AttributionSource | null;
-  /** Coupon and UTM pointed at different creators. */
+  /** Another signal (a second coupon or the UTM) pointed at a different creator. */
   conflict: boolean;
 };
 
 export type AttributionSignals = {
-  coupon: string | null;
+  /** Every discount code on the order, in the order the store sent them. */
+  coupons: string[];
   utmCampaign: string | null;
 };
 
@@ -26,22 +27,26 @@ export function normalizeUtm(value: string): string {
  * The attribution rule lives here and only here.
  *
  * - A sale goes to at most one creator.
- * - The coupon wins over the UTM: it is a code the creator owns and the buyer
+ * - A coupon wins over the UTM: it is a code the creator owns and the buyer
  *   typed, while a UTM only says which link the click came from.
- * - When coupon and UTM point at different creators the coupon wins and the
- *   order is flagged with `conflict` so the choice stays auditable.
+ * - With several creator coupons on one order, the first one the store sent wins.
+ * - When another signal points at a different creator, the winner is kept and
+ *   the order is flagged with `conflict` so the choice stays auditable.
  * - No match means the sale is not attributed.
+ *
+ * `couponCreators` is the creator matched by each coupon, in order (null when
+ * the coupon belongs to no creator).
  */
-export function decideAttribution(couponCreator: string | null, utmCreator: string | null): Attribution {
-  if (couponCreator) {
-    return {
-      creatorId: couponCreator,
-      source: "coupon",
-      conflict: utmCreator !== null && utmCreator !== couponCreator,
-    };
-  }
-  if (utmCreator) return { creatorId: utmCreator, source: "utm", conflict: false };
-  return { creatorId: null, source: null, conflict: false };
+export function decideAttribution(couponCreators: Array<string | null>, utmCreator: string | null): Attribution {
+  const candidates = couponCreators.filter((id): id is string => id !== null);
+  const winner = candidates[0] ?? utmCreator;
+  if (!winner) return { creatorId: null, source: null, conflict: false };
+  const others = [...candidates, utmCreator].filter((id): id is string => id !== null);
+  return {
+    creatorId: winner,
+    source: candidates.length > 0 ? "coupon" : "utm",
+    conflict: others.some((id) => id !== winner),
+  };
 }
 
 function creatorBy(db: DatabaseSync, column: "coupon_code" | "utm_code", value: string | null): string | null {
@@ -51,7 +56,7 @@ function creatorBy(db: DatabaseSync, column: "coupon_code" | "utm_code", value: 
 }
 
 export function attributeOrder(db: DatabaseSync, signals: AttributionSignals): Attribution {
-  const coupon = signals.coupon ? normalizeCoupon(signals.coupon) : null;
+  const couponCreators = signals.coupons.map((code) => creatorBy(db, "coupon_code", normalizeCoupon(code)));
   const utm = signals.utmCampaign ? normalizeUtm(signals.utmCampaign) : null;
-  return decideAttribution(creatorBy(db, "coupon_code", coupon), creatorBy(db, "utm_code", utm));
+  return decideAttribution(couponCreators, creatorBy(db, "utm_code", utm));
 }
