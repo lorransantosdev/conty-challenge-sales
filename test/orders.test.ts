@@ -115,6 +115,76 @@ describe("order ingestion and attribution", () => {
     expect(asString.status).toBe(201);
   });
 
+  it("stores a paid order with total 0.00 (100% coupon) and attributes it", async () => {
+    const res = await post(app, "/webhooks/orders", order({ total: "0.00" }));
+    expect(res.status).toBe(201);
+    expect(res.body.order).toMatchObject({ creator_id: "crt_ana", total_cents: 0, net_cents: 0, status: "paid" });
+  });
+
+  it("checks the status before the total, so a non-sale order is ignored, not rejected", async () => {
+    const res = await post(app, "/webhooks/orders", order({ status: "pending", total: "0.00" }));
+    expect(res.status).toBe(202);
+  });
+
+  it("stores an order whose first webhook already says partially_refunded", async () => {
+    const res = await post(app, "/webhooks/orders", order({ financial_status: "partially_refunded" }));
+    expect(res.status).toBe(201);
+    expect(res.body.order).toMatchObject({ creator_id: "crt_ana", total_cents: 20000 });
+  });
+
+  it("reads every discount code and attributes to the first creator coupon", async () => {
+    const res = await post(app, "/webhooks/orders", {
+      id: "ord_multi",
+      total: "80.00",
+      discount_codes: [{ code: "FREESHIP" }, { code: "bruno15" }],
+    });
+    expect(res.body.order).toMatchObject({
+      creator_id: "crt_bruno",
+      attribution: { source: "coupon", conflict: false, coupon_codes: ["FREESHIP", "BRUNO15"] },
+    });
+  });
+
+  it("flags a conflict when two creator coupons are on the same order", async () => {
+    const res = await post(app, "/webhooks/orders", {
+      id: "ord_two",
+      total: "80.00",
+      discount_codes: [{ code: "ANA10" }, { code: "BRUNO15" }],
+    });
+    expect(res.body.order).toMatchObject({ creator_id: "crt_ana", attribution: { conflict: true } });
+  });
+
+  it("ignores the URL fragment when reading UTMs from landing_site", async () => {
+    const res = await post(app, "/webhooks/orders", {
+      id: "ord_hash",
+      total: "10.00",
+      landing_site: "/p?utm_campaign=ana&utm_source=ig#top",
+    });
+    expect(res.body.order).toMatchObject({
+      creator_id: "crt_ana",
+      attribution: { source: "utm", utm: { campaign: "ana", source: "ig" } },
+    });
+  });
+
+  it("returns the signals behind the attribution so it can be audited", async () => {
+    const res = await post(app, "/webhooks/orders", order({ utm: { source: "ig", medium: "social", campaign: "Bruno" } }));
+    expect(res.body.order.attribution).toEqual({
+      source: "coupon",
+      conflict: true,
+      coupon_codes: ["ANA10"],
+      utm: { source: "ig", medium: "social", campaign: "bruno" },
+    });
+  });
+
+  it("rejects totals above the maximum amount", async () => {
+    expect((await post(app, "/webhooks/orders", order({ total: "1000000000.01" }))).status).toBe(400);
+  });
+
+  it("returns the creator as stored (normalized) and rejects non-string codes", async () => {
+    const created = await post(app, "/creators", { id: "crt_caio", name: "Caio", coupon_code: " caio5 ", utm_code: "Caio" });
+    expect(created.body).toEqual({ id: "crt_caio", name: "Caio", coupon_code: "CAIO5", utm_code: "caio" });
+    expect((await post(app, "/creators", { id: "crt_d", name: "D", coupon_code: 123 })).status).toBe(400);
+  });
+
   it("does not allow two creators to share a coupon or UTM code", async () => {
     const res = await post(app, "/creators", { id: "crt_x", name: "X", coupon_code: "ANA10" });
     expect(res.status).toBe(409);
@@ -222,6 +292,40 @@ describe("refunds", () => {
     await post(app, "/webhooks/orders", order());
     await post(app, "/webhooks/orders", order());
     expect((await get(app, "/orders/ord_1")).body).toMatchObject({ refunded_cents: 5000, net_cents: 15000 });
+  });
+
+  it("the same refund id with a different amount or order is a conflict (409) and the first is kept", async () => {
+    await post(app, "/webhooks/orders", order());
+    await post(app, "/webhooks/refunds", { id: "ref_1", order_id: "ord_1", amount: "10.00" });
+    const amount = await post(app, "/webhooks/refunds", { id: "ref_1", order_id: "ord_1", amount: "50.00" });
+    expect(amount.status).toBe(409);
+    expect(amount.body.refund).toMatchObject({ requested_cents: 1000 });
+    const other = await post(app, "/webhooks/refunds", { id: "ref_1", order_id: "ord_9", amount: "10.00" });
+    expect(other.status).toBe(409);
+    expect((await get(app, "/orders/ord_1")).body).toMatchObject({ refunded_cents: 1000 });
+  });
+
+  it("accepts a Shopify refund with the amount in transactions", async () => {
+    await post(app, "/webhooks/orders", order());
+    const res = await post(app, "/webhooks/refunds", {
+      id: 9001,
+      order_id: "ord_1",
+      transactions: [
+        { kind: "refund", amount: "30.00" },
+        { kind: "refund", amount: "5.50" },
+      ],
+    });
+    expect(res.status).toBe(201);
+    expect(res.body.refund).toMatchObject({ id: "9001", requested_cents: 3550, applied_cents: 3550 });
+  });
+
+  it("lists refunds still waiting for their order", async () => {
+    await post(app, "/webhooks/refunds", { id: "ref_1", order_id: "ord_late", amount: "5.00" });
+    await post(app, "/webhooks/orders", order({ id: "ord_late", status: "voided" }));
+    const pending = await get(app, "/refunds/pending");
+    expect(pending.body.refunds.map((r: Json) => r.id)).toEqual(["ref_1"]);
+    await post(app, "/webhooks/orders", order({ id: "ord_late" }));
+    expect((await get(app, "/refunds/pending")).body.refunds).toEqual([]);
   });
 
   it("rejects invalid refunds", async () => {

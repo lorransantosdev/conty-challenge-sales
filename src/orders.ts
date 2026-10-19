@@ -6,7 +6,7 @@ export type OrderInput = {
   id: string;
   totalCents: number;
   currency: string;
-  coupon: string | null;
+  coupons: string[];
   utm: { source: string | null; medium: string | null; campaign: string | null };
 };
 
@@ -16,6 +16,10 @@ type OrderRow = {
   id: string;
   total_cents: number;
   currency: string;
+  coupon_codes: string;
+  utm_source: string | null;
+  utm_medium: string | null;
+  utm_campaign: string | null;
   creator_id: string | null;
   attribution_source: AttributionSource | null;
   attribution_conflict: number;
@@ -48,7 +52,13 @@ export type OrderView = {
   currency: string;
   status: "paid" | "partially_refunded" | "refunded";
   creator_id: string | null;
-  attribution: { source: AttributionSource | null; conflict: boolean };
+  /** The signals the decision was made from, so it can be audited later. */
+  attribution: {
+    source: AttributionSource | null;
+    conflict: boolean;
+    coupon_codes: string[];
+    utm: { source: string | null; medium: string | null; campaign: string | null };
+  };
   refunded_cents: number;
   net_cents: number;
   refunds: RefundView[];
@@ -87,17 +97,17 @@ export function ingestOrder(db: DatabaseSync, input: OrderInput): { outcome: "cr
     const existing = db.prepare("SELECT * FROM orders WHERE id = ?").get(input.id) as OrderRow | undefined;
     if (existing) return { outcome: "duplicate", order: viewOrder(db, existing) };
 
-    const attribution = attributeOrder(db, { coupon: input.coupon, utmCampaign: input.utm.campaign });
+    const attribution = attributeOrder(db, { coupons: input.coupons, utmCampaign: input.utm.campaign });
     const now = new Date().toISOString();
     db.prepare(
-      `INSERT INTO orders (id, total_cents, currency, coupon_code, utm_source, utm_medium, utm_campaign,
+      `INSERT INTO orders (id, total_cents, currency, coupon_codes, utm_source, utm_medium, utm_campaign,
          creator_id, attribution_source, attribution_conflict, received_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       input.id,
       input.totalCents,
       input.currency,
-      input.coupon ? normalizeCoupon(input.coupon) : null,
+      JSON.stringify(input.coupons.map(normalizeCoupon)),
       input.utm.source,
       input.utm.medium,
       input.utm.campaign ? normalizeUtm(input.utm.campaign) : null,
@@ -119,13 +129,21 @@ export function ingestOrder(db: DatabaseSync, input: OrderInput): { outcome: "cr
   });
 }
 
+/**
+ * A replayed refund id with the same order and amount is a retry (no-op).
+ * The same id with a different order or amount is a conflict: the first one is
+ * kept and the caller is told, instead of silently dropping the second payload.
+ */
 export function ingestRefund(
   db: DatabaseSync,
   input: RefundInput,
-): { outcome: "created" | "duplicate"; refund: RefundView } {
+): { outcome: "created" | "duplicate" | "conflict"; refund: RefundView } {
   return inTransaction(db, () => {
     const existing = db.prepare("SELECT * FROM refunds WHERE id = ?").get(input.id) as RefundRow | undefined;
-    if (existing) return { outcome: "duplicate", refund: refundView(existing) };
+    if (existing) {
+      const same = existing.order_id === input.orderId && existing.requested_cents === input.amountCents;
+      return { outcome: same ? "duplicate" : "conflict", refund: refundView(existing) };
+    }
 
     const now = new Date().toISOString();
     db.prepare(
@@ -152,7 +170,12 @@ function viewOrder(db: DatabaseSync, order: OrderRow): OrderView {
     currency: order.currency,
     status,
     creator_id: order.creator_id,
-    attribution: { source: order.attribution_source, conflict: order.attribution_conflict === 1 },
+    attribution: {
+      source: order.attribution_source,
+      conflict: order.attribution_conflict === 1,
+      coupon_codes: JSON.parse(order.coupon_codes) as string[],
+      utm: { source: order.utm_source, medium: order.utm_medium, campaign: order.utm_campaign },
+    },
     refunded_cents: refunded,
     net_cents: order.total_cents - refunded,
     refunds,
@@ -167,6 +190,14 @@ export function getOrder(db: DatabaseSync, id: string): OrderView | null {
 export function getRefund(db: DatabaseSync, id: string): RefundView | null {
   const row = db.prepare("SELECT * FROM refunds WHERE id = ?").get(id) as RefundRow | undefined;
   return row ? refundView(row) : null;
+}
+
+/** Refunds still waiting for their order, oldest first. */
+export function pendingRefunds(db: DatabaseSync): RefundView[] {
+  const rows = db
+    .prepare("SELECT * FROM refunds WHERE applied_cents IS NULL ORDER BY received_at, rowid")
+    .all() as RefundRow[];
+  return rows.map(refundView);
 }
 
 export function creatorSales(db: DatabaseSync, creatorId: string) {
