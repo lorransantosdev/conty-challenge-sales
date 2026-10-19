@@ -93,3 +93,10 @@ src/money.ts        decimal string -> integer cents
 src/db.ts           schema and transaction helper
 src/app.ts          HTTP routes
 ```
+
+## AI use and review
+
+I used AI to help design the data model and draft the code and tests. I reviewed
+the code, ran the suite (28 tests) and `tsc --noEmit`, and checked each rule in
+this README against a test. I made the design decisions listed above, notably the
+coupon-over-UTM tie-break and the cap on refunds. No real store is connected.
